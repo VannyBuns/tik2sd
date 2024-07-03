@@ -5,78 +5,52 @@
  * of the MIT license.  See the LICENSE file for details.
  */
 #include <string.h>
+#include <stdint.h>
 #include <malloc.h>
 #include <unistd.h>
 #include <stdio.h>
-#include <iosuhax.h>
+#include <mocha/mocha.h>
+#include <coreinit/filesystem.h>
+#include <coreinit/filesystem_fsa.h>
+#include <coreinit/launch.h>
+#include <coreinit/screen.h>
+#include <coreinit/foreground.h>
+#include <coreinit/thread.h>
+#include <coreinit/memory.h>
+#include <sysapp/launch.h>
+#include <whb/log.h>
+#include <vpad/input.h>
+#include <whb/proc.h>
+#include <proc_ui/procui.h>
+#include <iostream>
 #include <vector>
 #include <set>
 #include <string>
-#include "dynamic_libs/os_functions.h"
-#include "dynamic_libs/sys_functions.h"
-#include "dynamic_libs/vpad_functions.h"
-#include "system/memory.h"
-#include "common/common.h"
-#include "main.h"
-#include "exploit.h"
-#include "../payload/wupserver_bin.h"
-
-static const char *sdCardVolPath = "/vol/storage_sdcard";
+static const char *sdCardVolPath = "/vol/external01";
 static const char *tikPath = "/vol/system/rights/ticket/apps";
 static const char *oddTikVolPath = "/vol/storage_odd_tickets";
-//just to be able to call async
-void someFunc(void *arg)
-{
-	(void)arg;
-}
-
-static int mcp_hook_fd = -1;
-int MCPHookOpen()
-{
-	//take over mcp thread
-	mcp_hook_fd = MCP_Open();
-	if(mcp_hook_fd < 0)
-		return -1;
-	IOS_IoctlAsync(mcp_hook_fd, 0x62, (void*)0, 0, (void*)0, 0, (void*)someFunc, (void*)0);
-	//let wupserver start up
-	sleep(1);
-	if(IOSUHAX_Open("/dev/mcp") < 0)
-		return -1;
-	return 0;
-}
-
-void MCPHookClose()
-{
-	if(mcp_hook_fd < 0)
-		return;
-	//close down wupserver, return control to mcp
-	IOSUHAX_Close();
-	//wait for mcp to return
-	sleep(1);
-	MCP_Close(mcp_hook_fd);
-	mcp_hook_fd = -1;
-}
+#define EXIT_RELAUNCH_ON_LOAD       0xFFFFFFFD
 
 void println(int line, const char *msg)
 {
 	int i;
 	for(i = 0; i < 2; i++)
 	{	//double-buffered font write
-		OSScreenPutFontEx(0,0,line,msg);
-		OSScreenPutFontEx(1,0,line,msg);
-		OSScreenFlipBuffersEx(0);
-		OSScreenFlipBuffersEx(1);
+		OSScreenPutFontEx(SCREEN_TV,0,line,msg);
+		OSScreenPutFontEx(SCREEN_DRC,0,line,msg);
+		OSScreenFlipBuffersEx(SCREEN_TV);
+		OSScreenFlipBuffersEx(SCREEN_DRC);
 	}
 }
 
-int fsa_read(int fsa_fd, int fd, void *buf, int len)
+int fsa_read(FSAClientHandle fsa_fd, int fd, void *buf, int len)
 {
 	int done = 0;
 	uint8_t *buf_u8 = (uint8_t*)buf;
 	while(done < len)
 	{
 		size_t read_size = len - done;
-		int result = IOSUHAX_FSA_ReadFile(fsa_fd, buf_u8 + done, 0x01, read_size, fd, 0);
+		int result = FSAReadFile(fsa_fd, buf_u8 + done, 0x01, read_size, fd, 0);
 		if(result < 0)
 			return result;
 		else
@@ -85,14 +59,14 @@ int fsa_read(int fsa_fd, int fd, void *buf, int len)
 	return done;
 }
 
-int fsa_write(int fsa_fd, int fd, const void *buf, int len)
+int fsa_write(FSAClientHandle fsa_fd, int fd, const void *buf, int len)
 {
 	int done = 0;
 	uint8_t *buf_u8 = (uint8_t*)buf;
 	while(done < len)
 	{
 		size_t write_size = len - done;
-		int result = IOSUHAX_FSA_WriteFile(fsa_fd, buf_u8 + done, 0x01, write_size, fd, 0);
+		int result = FSAWriteFile(fsa_fd, buf_u8 + done, 0x01, write_size, fd, 0);
 		if(result < 0)
 			return result;
 		else
@@ -105,120 +79,109 @@ struct DirName {
 	char n[0x100];
 };
 
-extern "C" int Menu_Main(void)
+int main(int argc, char **argv)
 {
-	InitOSFunctionPointers();
-	InitSysFunctionPointers();
-	InitVPadFunctionPointers();
-	VPADInit();
-	memoryInitialize();
-
+	WHBProcInit();
+	
+	if(Mocha_InitLibrary() != MOCHA_RESULT_SUCCESS)
+{
+	WHBLogPrint("Mocha_InitLibrary failed!");
+	return 0;
+	 
+}	
+	
 	// Init screen
 	OSScreenInit();
-	int screen_buf0_size = OSScreenGetBufferSizeEx(0);
-	int screen_buf1_size = OSScreenGetBufferSizeEx(1);
-	uint8_t *screenBuffer = (uint8_t*)MEMBucket_alloc(screen_buf0_size+screen_buf1_size, 0x100);
-	OSScreenSetBufferEx(0, screenBuffer);
-	OSScreenSetBufferEx(1, (screenBuffer + screen_buf0_size));
-	OSScreenEnableEx(0, 1);
-	OSScreenEnableEx(1, 1);
-	OSScreenClearBufferEx(0, 0);
-	OSScreenClearBufferEx(1, 0);
+	int screen_buf0_size = OSScreenGetBufferSizeEx(SCREEN_TV);
+	int screen_buf1_size = OSScreenGetBufferSizeEx(SCREEN_DRC);
+	uint8_t *screenBuffer = (uint8_t*)memalign(0x40, screen_buf0_size+screen_buf1_size);
+	OSScreenSetBufferEx(SCREEN_TV, screenBuffer);
+	OSScreenSetBufferEx(SCREEN_DRC, (screenBuffer + screen_buf0_size));
+	OSScreenEnableEx(SCREEN_TV, 1);
+	OSScreenEnableEx(SCREEN_DRC, 1);
+	OSScreenClearBufferEx(SCREEN_TV, 0);
+	OSScreenClearBufferEx(SCREEN_DRC, 0);
+	
+int action = 0;
 
-	println(0,"tik2sd v1.1u2 by FIX94");
-	println(2,"Press A to backup your console tickets.");
-	println(3,"Press B to backup your current disc ticket.");
-
-	int vpadError = -1;
-	VPADData vpad;
-	//wait for user to decide option
-	int action = 0;
-	while(1)
-	{
-		VPADRead(0, &vpad, 1, &vpadError);
-
-		if(vpadError == 0)
+while(WHBProcIsRunning())
+	{		
+		println(0,"tik2sd v1.2 by VannyBuns");
+		println(2,"Press A to backup your console tickets.");
+		println(3,"Press B to backup your current disc ticket.");
+		println(5,"Press HOME to return to the Wii U Menu.");				
+		VPADReadError error;
+		VPADStatus status;
+		//wait for user to decide option
+		VPADRead(VPAD_CHAN_0, &status, 1, &error);
+		if(error == 0)
 		{
-			if((vpad.btns_d | vpad.btns_h) & VPAD_BUTTON_HOME)
-			{
-				MEMBucket_free(screenBuffer);
-				memoryRelease();
-				return EXIT_SUCCESS;
-			}
-			else if((vpad.btns_d | vpad.btns_h) & VPAD_BUTTON_A)
+			if((status.hold | status.trigger) & VPAD_BUTTON_A)
 				break;
-			else if((vpad.btns_d | vpad.btns_h) & VPAD_BUTTON_B)
-			{
-				action = 1;
-				break;
-			}
-		}
-		usleep(50000);
-	}
-
-	int line = 5;
-	int fsaFd = -1;
+				else if((status.hold | status.trigger) & VPAD_BUTTON_B)
+				{
+					action = 1;
+					break;
+				}	
+			}					
+        OSSleepTicks(OSMillisecondsToTicks(50));
+    }
+	
+	
+	FSAClientHandle fsaFd;
 	int sdMounted = 0, oddMounted = 0;
-	int sdFd = -1, tikFd = -1;
+	FSAFileHandle sdFd, tikFd;
+	int line = 6;
 	int ret;
 	size_t i;
 	std::vector<DirName> dirNames;
 	std::set<std::string> tKeys;
-	directoryEntry_s data;
-
-	//open up iosuhax
-	int res = IOSUHAX_Open(NULL);
-	if(res < 0)
-		res = MCPHookOpen();
-	if(res < 0)
+	FSDirectoryEntry data;
+	
+	FSAInit();
+	fsaFd = FSAAddClient(NULL);
+	if (fsaFd < 0) 
 	{
-		println(line++,"Doing IOSU Exploit...");
-		*(volatile unsigned int*)0xF5E70000 = wupserver_bin_len;
-		memcpy((void*)0xF5E70020, &wupserver_bin, wupserver_bin_len);
-		DCStoreRange((void*)0xF5E70000, wupserver_bin_len + 0x40);
-		IOSUExploit();
-		//done with iosu exploit, take over mcp
-		if(MCPHookOpen() < 0)
+		println(line++, "Failed to add FSA client!");
+		Mocha_DeInitLibrary();
+		return -1;
+	}
+	
+	ret = Mocha_UnlockFSClientEx(fsaFd);
+	if (ret != MOCHA_RESULT_SUCCESS) 
+	{
+		println(line++, "Failed to unlock FSA Client!");
+		FSADelClient(fsaFd);
+		Mocha_DeInitLibrary();
+		return 0;
+	}
+	
+		ret = Mocha_MountFSEx("storage_slc", "/dev/slc01", tikPath, FSA_MOUNT_FLAG_LOCAL_MOUNT, (char*)0,0);
+		if(ret < 0)
 		{
-			println(line++,"MCP hook could not be opened!");
-			goto prgEnd;
-		}
-		println(line++,"Done!");
-	}
-
-	//mount with full permissions
-	fsaFd = IOSUHAX_FSA_Open();
-	if(fsaFd < 0)
-	{
-		println(line++,"FSA could not be opened!");
-		goto prgEnd;
-	}
-	ret = IOSUHAX_FSA_Mount(fsaFd, "/dev/sdcard01", sdCardVolPath, 2, (char*)0, 0);
-	if(ret < 0)
-	{
-		println(line++,"Failed to mount SD!");
-		goto prgEnd;
-	}
+			println(line++,"Failed to mount SLC!");
+			 return 0;
+		}	
 	else
 		sdMounted = 1;
 	char sd2tikPath[256];
 	sprintf(sd2tikPath,"%s/tik2sd",sdCardVolPath);
-	IOSUHAX_FSA_MakeDir(fsaFd, sd2tikPath, 0x600);
+	FSAMakeDir(fsaFd, sd2tikPath, (FSMode)(FS_MODE_READ_OWNER | FS_MODE_WRITE_OWNER));
 	if(action == 0)
 	{
-		int handle;
-		if(IOSUHAX_FSA_OpenDir(fsaFd, tikPath, &handle) < 0)
+		FSADirectoryHandle handle;
+		if(FSAOpenDir(fsaFd, tikPath, &handle) < 0)
 		{
 			println(line++,"Failed to open tik folder!");
-			goto prgEnd;
+			 return 0;
 		}
-		while(1)
+		while(WHBProcIsRunning())
 		{
-			directoryEntry_s data;
-			ret = IOSUHAX_FSA_ReadDir(fsaFd, handle, &data);
+			FSDirectoryEntry data;
+			ret = FSAReadDir(fsaFd, handle, &data);
 			if(ret != 0)
 				break;
-			if(data.stat.flag & DIR_ENTRY_IS_DIRECTORY)
+			if(data.info.flags & FS_STAT_DIRECTORY)
 			{
 				DirName cD;
 				memcpy(cD.n, data.name, 0xFF);
@@ -226,33 +189,33 @@ extern "C" int Menu_Main(void)
 				dirNames.push_back(cD);
 			}
 		}
-		IOSUHAX_FSA_CloseDir(fsaFd, handle);
+		FSACloseDir(fsaFd, handle);
 		for(i = 0; i < dirNames.size(); i++)
 		{
 			char tikFolderPath[256];
 			sprintf(tikFolderPath, "%s/%s", tikPath, dirNames[i].n);
-			if(IOSUHAX_FSA_OpenDir(fsaFd, tikFolderPath, &handle) < 0)
+			if(FSAOpenDir(fsaFd, tikFolderPath, &handle) < 0)
 				continue;
 			char sdTikFolderPath[256];
 			sprintf(sdTikFolderPath, "%s/%s", sd2tikPath, dirNames[i].n);
-			IOSUHAX_FSA_MakeDir(fsaFd, sdTikFolderPath, 0x600);
-			while(1)
+			FSAMakeDir(fsaFd, sdTikFolderPath, (FSMode)(FS_MODE_READ_OWNER | FS_MODE_WRITE_OWNER));
+			while(WHBProcIsRunning())
 			{
-				ret = IOSUHAX_FSA_ReadDir(fsaFd, handle, &data);
+				ret = FSAReadDir(fsaFd, handle, &data);
 				if(ret != 0)
 					break;
-				if(!(data.stat.flag & DIR_ENTRY_IS_DIRECTORY))
+				if(!(data.info.flags & FS_STAT_DIRECTORY))
 				{
 					char tikRpath[256];
 					sprintf(tikRpath, "%s/%s", tikFolderPath, data.name);
-					if(IOSUHAX_FSA_OpenFile(fsaFd, tikRpath, "rb", &tikFd) >= 0)
+					if(FSAOpenFileEx(fsaFd, tikRpath, "rb", FS_MODE_READ_OWNER, FS_OPEN_FLAG_NONE, 1, &tikFd) >= 0)
 					{
-						fileStat_s stats;
-						IOSUHAX_FSA_StatFile(fsaFd, tikFd, &stats);
+						FSStat stats;
+						FSAGetStatFile(fsaFd, tikFd, &stats);
 						size_t tikLen = stats.size;
-						uint8_t *tikBuf = (uint8_t*)MEMBucket_alloc(tikLen,4);
+						uint8_t *tikBuf = (uint8_t*)memalign(4, tikLen);
 						fsa_read(fsaFd, tikFd, tikBuf, tikLen);
-						IOSUHAX_FSA_CloseFile(fsaFd, tikFd);
+						FSACloseFile(fsaFd, tikFd);
 						tikFd = -1;
 						bool checkTik = true;
 						int tikP = 0;
@@ -285,21 +248,21 @@ extern "C" int Menu_Main(void)
 						}
 						char tikWpath[256];
 						sprintf(tikWpath, "%s/%s", sdTikFolderPath, data.name);
-						if(IOSUHAX_FSA_OpenFile(fsaFd, tikWpath, "wb", &sdFd) >= 0)
+						if(FSAOpenFileEx(fsaFd, tikWpath, "wb", FS_MODE_WRITE_OWNER, FS_OPEN_FLAG_NONE, 1, &sdFd) >= 0)
 						{
 							fsa_write(fsaFd, sdFd, tikBuf, tikLen);
-							IOSUHAX_FSA_CloseFile(fsaFd, sdFd);
+							FSACloseFile(fsaFd, sdFd);
 							sdFd = -1;
 						}
-						MEMBucket_free(tikBuf);
+						OSFreeToSystem(tikBuf);
 					}
 				}
 			}
-			IOSUHAX_FSA_CloseDir(fsaFd, handle);
+			FSACloseDir(fsaFd, handle);
 		}
 		char sdKeyPath[256];
 		sprintf(sdKeyPath, "%s/keys.txt", sd2tikPath);
-		if(IOSUHAX_FSA_OpenFile(fsaFd, sdKeyPath, "wb", &sdFd) >= 0)
+		if(FSAOpenFileEx(fsaFd, sdKeyPath, "wb", FS_MODE_WRITE_OWNER, FS_OPEN_FLAG_NONE, 1, &sdFd) >= 0)
 		{
 			char startMsg[64];
 			sprintf(startMsg, "Found %i unique tickets\n", tKeys.size());
@@ -309,93 +272,84 @@ extern "C" int Menu_Main(void)
 				const char *k = it->c_str();
 				fsa_write(fsaFd, sdFd, k, strlen(k));
 			}
-			IOSUHAX_FSA_CloseFile(fsaFd, sdFd);
+			FSACloseFile(fsaFd, sdFd);
 			sdFd = -1;
 		}
 	}
 	else
 	{
-		ret = IOSUHAX_FSA_Mount(fsaFd, "/dev/odd01", oddTikVolPath, 2, (char*)0, 0);
+		ret = Mocha_MountFSEx("storage_odd_content", "/dev/odd01", oddTikVolPath, FSA_MOUNT_FLAG_LOCAL_MOUNT, (char*)0,0);
 		if(ret < 0)
 		{
 			println(line++,"Failed to mount ODD!");
-			goto prgEnd;
+			 return 0;
 		}
 		else
 			oddMounted = 1;
-		int handle;
-		if(IOSUHAX_FSA_OpenDir(fsaFd, oddTikVolPath, &handle) < 0)
+		FSADirectoryHandle handle;
+		if(FSAOpenDir(fsaFd, oddTikVolPath, &handle) < 0)
 		{
 			println(line++,"Failed to open tik folder!");
-			goto prgEnd;
+			 return 0;
 		}
 		char sdTikFolderPath[256];
 		sprintf(sdTikFolderPath, "%s/odd", sd2tikPath);
-		IOSUHAX_FSA_MakeDir(fsaFd, sdTikFolderPath, 0x600);
-		while(1)
+		FSAMakeDir(fsaFd, sdTikFolderPath, (FSMode)(FS_MODE_READ_OWNER | FS_MODE_WRITE_OWNER));
+		while(WHBProcIsRunning())
 		{
-			directoryEntry_s data;
-			ret = IOSUHAX_FSA_ReadDir(fsaFd, handle, &data);
+			FSDirectoryEntry data;
+			ret = FSAReadDir(fsaFd, handle, &data);
 			if(ret != 0)
 				break;
-			if(data.stat.flag & DIR_ENTRY_IS_DIRECTORY)
+			if(data.info.flags & FS_STAT_DIRECTORY)
 			{
 				char tikRpath[256];
 				sprintf(tikRpath,"%s/%s/title.tik", oddTikVolPath, data.name);
-				if(IOSUHAX_FSA_OpenFile(fsaFd, tikRpath, "rb", &tikFd) >= 0)
+				if(FSAOpenFileEx(fsaFd, tikRpath, "rb", FS_MODE_READ_OWNER, FS_OPEN_FLAG_NONE, 1, &tikFd) >= 0)
 				{
-					fileStat_s stats;
-					IOSUHAX_FSA_StatFile(fsaFd, tikFd, &stats);
+					FSStat stats;
+					FSAGetStatFile(fsaFd, tikFd, &stats);
 					size_t tikLen = stats.size;
-					uint8_t *tikBuf = (uint8_t*)MEMBucket_alloc(tikLen,4);
+					uint8_t *tikBuf = (uint8_t*)memalign(4, tikLen);
 					fsa_read(fsaFd, tikFd, tikBuf, tikLen);
-					IOSUHAX_FSA_CloseFile(fsaFd, tikFd);
+					FSACloseFile(fsaFd, tikFd);
 					tikFd = -1;
 					if((*(uint32_t*)(tikBuf+0x1DC)) == 0x00050000)
 					{
 						char tikWpath[256];
 						sprintf(tikWpath, "%s/%08x%08x.tik", sdTikFolderPath, (*(uint32_t*)(tikBuf+0x1DC)), (*(uint32_t*)(tikBuf+0x1E0)));
-						if(IOSUHAX_FSA_OpenFile(fsaFd, tikWpath, "wb", &sdFd) >= 0)
+						if(FSAOpenFileEx(fsaFd, tikWpath, "wb", FS_MODE_WRITE_OWNER, FS_OPEN_FLAG_NONE, 1, &sdFd) >= 0)
 						{
 							fsa_write(fsaFd, sdFd, tikBuf, tikLen);
-							IOSUHAX_FSA_CloseFile(fsaFd, sdFd);
+							FSACloseFile(fsaFd, sdFd);
 							sdFd = -1;
 						}
 					}
-					MEMBucket_free(tikBuf);
+					OSFreeToSystem(tikBuf);
 				}
 			}
 		}
-		IOSUHAX_FSA_CloseDir(fsaFd, handle);
+		FSACloseDir(fsaFd, handle);
 	}
 	println(line++,"Tickets backed up!");
-
-prgEnd:
-	//close down everything fsa related
+	
 	if(fsaFd >= 0)
-	{
-		if(sdFd >= 0)
-			IOSUHAX_FSA_CloseFile(fsaFd, sdFd);
-		if(tikFd >= 0)
-			IOSUHAX_FSA_CloseFile(fsaFd, tikFd);
-		if(sdMounted)
-			IOSUHAX_FSA_Unmount(fsaFd, sdCardVolPath, 2);
-		if(oddMounted)
-			IOSUHAX_FSA_Unmount(fsaFd, oddTikVolPath, 2);
-		IOSUHAX_FSA_Close(fsaFd);
-	}
-	//close out iosuhax
-	if(mcp_hook_fd >= 0)
-		MCPHookClose();
-	else
-		IOSUHAX_Close();
-	sleep(5);
-	//will do IOSU reboot
-	OSForceFullRelaunch();
-	SYSLaunchMenu();
-	OSScreenEnableEx(0, 0);
-	OSScreenEnableEx(1, 0);
-	MEMBucket_free(screenBuffer);
-	memoryRelease();
-	return EXIT_RELAUNCH_ON_LOAD;
+		{
+			if(sdFd >= 0)
+				FSACloseFile(fsaFd, sdFd);
+			if(tikFd >= 0)
+				FSACloseFile(fsaFd, tikFd);
+			if(sdMounted)
+				FSAUnmount(fsaFd, sdCardVolPath, FSA_UNMOUNT_FLAG_FORCE);
+			if(oddMounted)
+				FSAUnmount(fsaFd, oddTikVolPath, FSA_UNMOUNT_FLAG_FORCE);
+			FSADelClient(fsaFd);
+		}
+			Mocha_UnmountFS("storage_slc");
+			OSForceFullRelaunch();
+			SYSLaunchMenu();			
+			OSFreeToSystem(screenBuffer);
+			Mocha_DeInitLibrary();
+			WHBProcShutdown();
+			return EXIT_RELAUNCH_ON_LOAD;
 }
